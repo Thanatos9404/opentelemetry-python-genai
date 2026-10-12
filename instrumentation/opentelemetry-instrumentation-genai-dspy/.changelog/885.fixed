@@ -1,0 +1,1 @@
+Record `gen_ai.response.finish_reasons` on `dspy.ReAct` and `dspy.ReActV2` agent spans regardless of content capture: `stop` when the agent finishes, `max_iters` when it runs out of iterations, and `error` when its loop ends early. The output message `finish_reason` now uses the same value instead of always `stop`.
