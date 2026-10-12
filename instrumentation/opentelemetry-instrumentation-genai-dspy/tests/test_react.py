@@ -11,6 +11,7 @@ from unittest import mock
 
 import dspy
 import pytest
+from dspy.utils.exceptions import ContextWindowExceededError
 
 from opentelemetry.instrumentation.genai.dspy import DSPyInstrumentor
 from opentelemetry.sdk._logs import LoggerProvider
@@ -91,6 +92,60 @@ class MockExtract:
 
     async def acall(self, **kwargs: object) -> dict[str, str]:
         return {"answer": "15"}
+
+
+class InvalidToolPredict:
+    """Fails tool selection, which makes ReAct end its loop early."""
+
+    def __call__(self, **kwargs: object) -> object:
+        raise ValueError("Agent selected an unknown tool")
+
+    async def acall(self, **kwargs: object) -> object:
+        raise ValueError("Agent selected an unknown tool")
+
+
+class ContextOverflowPredict:
+    """Never finishes and overflows the context window on the third call."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __call__(self, **kwargs: object) -> object:
+        self.count += 1
+        if self.count == 3:
+            raise ContextWindowExceededError()
+
+        class Pred:
+            next_thought = "Need to calculate add"
+            next_tool_name = "add"
+            next_tool_args = {"x": 2, "y": 2}
+
+        return Pred()
+
+
+def assert_agent_finish_reason(
+    span_exporter: InMemorySpanExporter,
+    agent_name: str,
+    finish_reason: str,
+    content_capture: str,
+) -> None:
+    agent_spans = [
+        s
+        for s in span_exporter.get_finished_spans()
+        if s.name == f"invoke_agent {agent_name}"
+    ]
+    assert len(agent_spans) == 1
+    assert agent_spans[0].status.status_code == StatusCode.UNSET
+
+    attrs = agent_spans[0].attributes or {}
+    assert attrs.get(GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == (finish_reason,)
+
+    output_msgs_raw = attrs.get(GenAI.GEN_AI_OUTPUT_MESSAGES)
+    if content_capture == "NO_CONTENT":
+        assert output_msgs_raw is None
+    else:
+        output_msgs = json.loads(str(output_msgs_raw))
+        assert output_msgs[0]["finish_reason"] == finish_reason
 
 
 def test_react_sync_execution(
@@ -308,3 +363,161 @@ async def test_react_async_error_handling(
     assert span.status.status_code == StatusCode.ERROR
     attrs = span.attributes or {}
     assert attrs.get(error_attributes.ERROR_TYPE) == "RuntimeError"
+
+
+@pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
+@pytest.mark.parametrize(
+    ("call_kwargs", "finish_reason"),
+    [({}, "stop"), ({"max_iters": 1}, "max_iters")],
+    ids=["finish", "max_iters"],
+)
+def test_react_finish_reasons(
+    tracer_provider: TracerProvider,
+    logger_provider: LoggerProvider,
+    meter_provider: MeterProvider,
+    span_exporter: InMemorySpanExporter,
+    content_capture: str,
+    call_kwargs: dict[str, Any],
+    finish_reason: str,
+) -> None:
+    with instrument(
+        DSPyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture=content_capture,
+    ):
+        tool = dspy.Tool(add, name="add", desc="Add two numbers.")
+        react = dspy.ReAct("question -> answer", tools=[tool])
+        react.react = MockSyncPredict()
+        react.extract = MockExtract()
+
+        res = react(question="What is 2 + 2?", **call_kwargs)
+        assert res.answer == "4"
+
+    assert_agent_finish_reason(
+        span_exporter, "dspy.ReAct", finish_reason, content_capture
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
+@pytest.mark.parametrize(
+    ("max_iters", "finish_reason"),
+    [(20, "stop"), (1, "max_iters")],
+    ids=["finish", "max_iters"],
+)
+async def test_react_async_finish_reasons(
+    tracer_provider: TracerProvider,
+    logger_provider: LoggerProvider,
+    meter_provider: MeterProvider,
+    span_exporter: InMemorySpanExporter,
+    content_capture: str,
+    max_iters: int,
+    finish_reason: str,
+) -> None:
+    with instrument(
+        DSPyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture=content_capture,
+    ):
+        tool = dspy.Tool(
+            async_multiply, name="multiply", desc="Multiply numbers."
+        )
+        react = dspy.ReAct(
+            "question -> answer", tools=[tool], max_iters=max_iters
+        )
+        react.react = MockAsyncPredict()
+        react.extract = MockExtract()
+
+        res = await react.aforward(question="What is 3 * 5?")
+        assert res.answer == "15"
+
+    assert_agent_finish_reason(
+        span_exporter, "dspy.ReAct", finish_reason, content_capture
+    )
+
+
+def test_react_finish_reason_when_loop_ends_early(
+    tracer_provider: TracerProvider,
+    logger_provider: LoggerProvider,
+    meter_provider: MeterProvider,
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    with instrument(
+        DSPyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        tool = dspy.Tool(add, name="add", desc="Add two numbers.")
+        react = dspy.ReAct("question -> answer", tools=[tool])
+        react.react = InvalidToolPredict()
+        react.extract = MockExtract()
+
+        res = react(question="What is 2 + 2?")
+        assert res.answer == "4"
+
+    assert_agent_finish_reason(
+        span_exporter, "dspy.ReAct", "error", "SPAN_ONLY"
+    )
+
+
+@pytest.mark.anyio
+async def test_react_async_finish_reason_when_loop_ends_early(
+    tracer_provider: TracerProvider,
+    logger_provider: LoggerProvider,
+    meter_provider: MeterProvider,
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    with instrument(
+        DSPyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        tool = dspy.Tool(
+            async_multiply, name="multiply", desc="Multiply numbers."
+        )
+        react = dspy.ReAct("question -> answer", tools=[tool])
+        react.react = InvalidToolPredict()
+        react.extract = MockExtract()
+
+        res = await react.aforward(question="What is 3 * 5?")
+        assert res.answer == "15"
+
+    assert_agent_finish_reason(
+        span_exporter, "dspy.ReAct", "error", "SPAN_ONLY"
+    )
+
+
+def test_react_finish_reason_after_trajectory_truncation(
+    tracer_provider: TracerProvider,
+    logger_provider: LoggerProvider,
+    meter_provider: MeterProvider,
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    with instrument(
+        DSPyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="NO_CONTENT",
+    ):
+        tool = dspy.Tool(add, name="add", desc="Add two numbers.")
+        react = dspy.ReAct("question -> answer", tools=[tool], max_iters=3)
+        react.react = ContextOverflowPredict()
+        react.extract = MockExtract()
+
+        res = react(question="What is 2 + 2?")
+        assert res.answer == "4"
+        assert "tool_name_0" not in res.trajectory
+        assert "tool_name_2" in res.trajectory
+
+    assert_agent_finish_reason(
+        span_exporter, "dspy.ReAct", "max_iters", "NO_CONTENT"
+    )
