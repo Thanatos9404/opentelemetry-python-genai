@@ -859,6 +859,19 @@ class TestMakeInputMessage:
         assert len(result) == 1
         assert result[0].parts[0].content == "Hi"
 
+    def test_messages_key_malformed_entry_keeps_convertible_entries(self):
+        result = make_input_message(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    ("human",),
+                    HumanMessage(content="Hi"),
+                ]
+            }
+        )
+
+        assert [m.parts[0].content for m in result] == ["Hello", "Hi"]
+
     def test_messages_key_all_malformed_returns_empty_without_raising(self):
         result = make_input_message(
             {"messages": [("human",), None, {"content": "x"}]}
@@ -954,6 +967,36 @@ class TestMakeOutputMessage:
         assert result[0].finish_reason == ""
         assert result[0].parts[0].content == "The answer is 42"
 
+    @pytest.mark.parametrize(
+        "assistant_entry",
+        [
+            {"role": "assistant", "content": "Hello"},
+            ("ai", "Hello"),
+        ],
+    )
+    def test_message_like_assistant_entry_produces_assistant_output(
+        self, assistant_entry
+    ):
+        result = make_output_message({"messages": [assistant_entry]})
+
+        assert len(result) == 1
+        assert result[0].role == "assistant"
+        assert result[0].parts[0].content == "Hello"
+
+    def test_malformed_entry_keeps_convertible_assistant_entries(self):
+        result = make_output_message(
+            {
+                "messages": [
+                    {"role": "not_a_real_role", "content": "dropped"},
+                    None,
+                    {"role": "assistant", "content": "kept"},
+                ]
+            }
+        )
+
+        assert len(result) == 1
+        assert result[0].parts[0].content == "kept"
+
     def test_non_ai_message_skipped(self):
         human_msg = HumanMessage(content="Hello")
         result = make_output_message({"messages": [human_msg]})
@@ -1026,6 +1069,16 @@ class TestMakeLastOutputMessage:
         msgs = [
             AIMessage(content="intermediate"),
             AIMessage(content="final answer"),
+        ]
+        result = make_last_output_message({"messages": msgs})
+
+        assert len(result) == 1
+        assert result[0].parts[0].content == "final answer"
+
+    def test_returns_last_assistant_message_in_dict_form(self):
+        msgs = [
+            AIMessage(content="intermediate"),
+            {"role": "assistant", "content": "final answer"},
         ]
         result = make_last_output_message({"messages": msgs})
 
@@ -1189,6 +1242,32 @@ class TestOutputMessagesOnInvocations:
         assert assigned[0].role == "assistant"
         assert assigned[0].parts[0].content == "The final answer is 42"
 
+    def test_workflow_output_messages_from_role_content_dicts(self):
+        handler, _, workflow_inv, _ = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={"name": "LangGraph"},
+            inputs={"messages": [{"role": "user", "content": "hi"}]},
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        handler.on_chain_end(
+            outputs={
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "The final answer is 42"},
+                ]
+            },
+            run_id=run_id,
+        )
+
+        assigned = workflow_inv.output_messages
+        assert len(assigned) == 1
+        assert assigned[0].role == "assistant"
+        assert assigned[0].parts[0].content == "The final answer is 42"
+
     def test_workflow_output_messages_only_last_ai_message(self):
         handler, _, workflow_inv, _ = _make_handler()
         run_id = _run_id()
@@ -1260,6 +1339,33 @@ class TestOutputMessagesOnInvocations:
 
         assigned = agent_inv.output_messages
         assert len(assigned) == 1
+        assert assigned[0].parts[0].content == "x = 3"
+
+    def test_agent_output_messages_from_role_content_dicts(self):
+        handler, _, _, agent_inv = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={"name": "math_agent"},
+            inputs={"messages": [{"role": "user", "content": "solve x"}]},
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={"agent_name": "math_agent"},
+        )
+
+        handler.on_chain_end(
+            outputs={
+                "messages": [
+                    {"role": "user", "content": "solve x"},
+                    {"role": "assistant", "content": "x = 3"},
+                ]
+            },
+            run_id=run_id,
+        )
+
+        assigned = agent_inv.output_messages
+        assert len(assigned) == 1
+        assert assigned[0].role == "assistant"
         assert assigned[0].parts[0].content == "x = 3"
 
     def test_agent_output_messages_only_last_ai_message(self):
