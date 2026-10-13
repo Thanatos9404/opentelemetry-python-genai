@@ -342,13 +342,20 @@ def _normalize_messages(
     messages: Iterable[MessageLikeRepresentation],
 ) -> list[BaseMessage]:
     """Convert entries to ``BaseMessage`` s, skipping unconvertible ones."""
-    normalized: list[BaseMessage] = []
-    for message in messages:
-        try:
-            normalized.extend(convert_to_messages([message]))
-        except Exception:  # pylint: disable=broad-except
-            continue
-    return normalized
+    materialized = list(messages)
+    try:
+        return convert_to_messages(materialized)
+    except Exception:  # pylint: disable=broad-except
+        normalized: list[BaseMessage] = []
+        for message in materialized:
+            if isinstance(message, BaseMessage):
+                normalized.append(message)
+                continue
+            try:
+                normalized.extend(convert_to_messages([message]))
+            except Exception:  # pylint: disable=broad-except
+                continue
+        return normalized
 
 
 def to_input_messages(
