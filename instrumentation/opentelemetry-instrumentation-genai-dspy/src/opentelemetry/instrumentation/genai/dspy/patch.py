@@ -504,7 +504,6 @@ def _set_agent_invocation_output(
         OutputMessage(
             role="assistant",
             parts=[TextPart(content=output_str)],
-            finish_reason=finish_reason,
         )
     ]
 
