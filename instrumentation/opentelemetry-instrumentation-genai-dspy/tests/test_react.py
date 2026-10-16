@@ -11,9 +11,11 @@ from unittest import mock
 
 import dspy
 import pytest
-from dspy.utils.exceptions import ContextWindowExceededError
 
 from opentelemetry.instrumentation.genai.dspy import DSPyInstrumentor
+from opentelemetry.instrumentation.genai.dspy.patch import (
+    _react_finish_reason,
+)
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.trace import TracerProvider
@@ -102,25 +104,6 @@ class InvalidToolPredict:
 
     async def acall(self, **kwargs: object) -> object:
         raise ValueError("Agent selected an unknown tool")
-
-
-class ContextOverflowPredict:
-    """Never finishes and overflows the context window on the third call."""
-
-    def __init__(self) -> None:
-        self.count = 0
-
-    def __call__(self, **kwargs: object) -> object:
-        self.count += 1
-        if self.count == 3:
-            raise ContextWindowExceededError()
-
-        class Pred:
-            next_thought = "Need to calculate add"
-            next_tool_name = "add"
-            next_tool_args = {"x": 2, "y": 2}
-
-        return Pred()
 
 
 def assert_agent_finish_reason(
@@ -368,7 +351,7 @@ async def test_react_async_error_handling(
 @pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
 @pytest.mark.parametrize(
     ("call_kwargs", "finish_reason"),
-    [({}, "stop"), ({"max_iters": 1}, "max_iters")],
+    [({}, "stop"), ({"max_iters": 1}, "error")],
     ids=["finish", "max_iters"],
 )
 def test_react_finish_reasons(
@@ -404,7 +387,7 @@ def test_react_finish_reasons(
 @pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
 @pytest.mark.parametrize(
     ("max_iters", "finish_reason"),
-    [(20, "stop"), (1, "max_iters")],
+    [(20, "stop"), (1, "error")],
     ids=["finish", "max_iters"],
 )
 async def test_react_async_finish_reasons(
@@ -495,29 +478,17 @@ async def test_react_async_finish_reason_when_loop_ends_early(
     )
 
 
-def test_react_finish_reason_after_trajectory_truncation(
-    tracer_provider: TracerProvider,
-    logger_provider: LoggerProvider,
-    meter_provider: MeterProvider,
-    span_exporter: InMemorySpanExporter,
+@pytest.mark.parametrize(
+    ("trajectory", "finish_reason"),
+    [
+        (None, "error"),
+        ({"tool_name_0": "add"}, "error"),
+        ({"tool_name_0": "add", "tool_name_1": "finish"}, "stop"),
+    ],
+    ids=["no_trajectory", "no_finish", "finish"],
+)
+def test_react_finish_reason_from_trajectory(
+    trajectory: dict[str, str] | None, finish_reason: str
 ) -> None:
-    with instrument(
-        DSPyInstrumentor(),
-        tracer_provider=tracer_provider,
-        logger_provider=logger_provider,
-        meter_provider=meter_provider,
-        content_capture="NO_CONTENT",
-    ):
-        tool = dspy.Tool(add, name="add", desc="Add two numbers.")
-        react = dspy.ReAct("question -> answer", tools=[tool], max_iters=3)
-        react.react = ContextOverflowPredict()
-        react.extract = MockExtract()
-
-        res = react(question="What is 2 + 2?")
-        assert res.answer == "4"
-        assert "tool_name_0" not in res.trajectory
-        assert "tool_name_2" in res.trajectory
-
-    assert_agent_finish_reason(
-        span_exporter, "dspy.ReAct", "max_iters", "NO_CONTENT"
-    )
+    result = dspy.Prediction(answer="4", trajectory=trajectory)
+    assert _react_finish_reason(result) == finish_reason

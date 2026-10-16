@@ -19,6 +19,9 @@ from tests.test_react import (
 )
 
 from opentelemetry.instrumentation.genai.dspy import DSPyInstrumentor
+from opentelemetry.instrumentation.genai.dspy.patch import (
+    _react_v2_finish_reason,
+)
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.trace import TracerProvider
@@ -120,6 +123,20 @@ class MockNeverSubmitPredictV2:
             )
 
         return CallPred()
+
+
+class MockParseErrorPredictV2:
+    """Fails to parse its first reply, then answers without `submit`."""
+
+    def __call__(self, **kwargs: object) -> object:
+        if "config" not in kwargs:
+            raise ValueError("Could not parse the reply")
+
+        class TextPred:
+            next_thought = "The answer is 4"
+            tool_calls = ToolCalls(tool_calls=[])
+
+        return TextPred()
 
 
 def test_react_v2_sync_execution(
@@ -280,7 +297,7 @@ def test_react_v2_missing_tolerated(
 @pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
 @pytest.mark.parametrize(
     ("call_kwargs", "finish_reason"),
-    [({}, "stop"), ({"max_iters": 1}, "max_iters")],
+    [({}, "stop"), ({"max_iters": 1}, "error")],
     ids=["submit", "max_iters"],
 )
 def test_react_v2_finish_reasons(
@@ -318,7 +335,7 @@ def test_react_v2_finish_reasons(
 @pytest.mark.parametrize("content_capture", ["SPAN_ONLY", "NO_CONTENT"])
 @pytest.mark.parametrize(
     ("max_iters", "finish_reason"),
-    [(20, "stop"), (1, "max_iters")],
+    [(20, "stop"), (1, "error")],
     ids=["submit", "max_iters"],
 )
 async def test_react_v2_async_finish_reasons(
@@ -405,35 +422,21 @@ async def test_react_v2_async_finish_reason_when_loop_ends_early(
     )
 
 
-@pytest.mark.parametrize("as_dict", [False, True], ids=["history", "dict"])
-def test_react_v2_finish_reason_ignores_caller_history(
-    tracer_provider: TracerProvider,
-    logger_provider: LoggerProvider,
-    meter_provider: MeterProvider,
-    span_exporter: InMemorySpanExporter,
-    as_dict: bool,
+@pytest.mark.parametrize(
+    ("termination_reason", "finish_reason"),
+    [
+        ("submit", "stop"),
+        ("forced_submit", "error"),
+        ("parse_error", "error"),
+        ("context_window_exceeded", "context_window_exceeded"),
+        (None, None),
+    ],
+)
+def test_react_v2_finish_reason_mapping(
+    termination_reason: str | None, finish_reason: str | None
 ) -> None:
-    messages = [{"question": "What is 1 + 1?", "answer": "2"}] * 3
-    history = (
-        {"messages": messages} if as_dict else dspy.History(messages=messages)
-    )
-    with instrument(
-        DSPyInstrumentor(),
-        tracer_provider=tracer_provider,
-        logger_provider=logger_provider,
-        meter_provider=meter_provider,
-        content_capture="NO_CONTENT",
-    ):
-        react_v2 = dspy.ReActV2("question -> answer", tools=[add], max_iters=2)
-        react_v2.react = MockNoToolCallsPredictV2()
-
-        res = react_v2(question="What is 2 + 2?", history=history)
-        assert res.answer == "4"
-        assert res.termination_reason == "forced_submit"
-
-    assert_agent_finish_reason(
-        span_exporter, "dspy.ReActV2", "error", "NO_CONTENT"
-    )
+    result = dspy.Prediction(answer="4", termination_reason=termination_reason)
+    assert _react_v2_finish_reason(result) == finish_reason
 
 
 @pytest.mark.parametrize(
@@ -443,10 +446,11 @@ def test_react_v2_finish_reason_ignores_caller_history(
         (
             MockNoToolCallsPredictV2(submit_when_forced=False),
             "empty_tool_calls",
-            "error",
+            "empty_tool_calls",
         ),
+        (MockParseErrorPredictV2(), "parse_error", "error"),
     ],
-    ids=["max_iters", "empty_tool_calls"],
+    ids=["max_iters", "empty_tool_calls", "parse_error"],
 )
 def test_react_v2_finish_reason_when_forced_submit_fails(
     tracer_provider: TracerProvider,

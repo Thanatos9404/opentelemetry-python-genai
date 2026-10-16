@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping, Sequence, Sized
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from copy import copy, deepcopy
 from importlib import import_module
@@ -58,7 +58,6 @@ _in_retrieval_invocation: ContextVar[bool] = ContextVar(
 )
 
 if TYPE_CHECKING:
-    from dspy.adapters.types.history import History
     from dspy.adapters.types.tool import Tool
     from dspy.dsp.colbertv2 import ColBERTv2
     from dspy.primitives.module import Module
@@ -67,7 +66,7 @@ if TYPE_CHECKING:
     from dspy.retrievers.retrieve import Retrieve
 
     _RetrieverInstance = Retrieve | ColBERTv2 | Embeddings
-    _FinishReasonFn = Callable[[Prediction, int | None, int], str | None]
+    _FinishReasonFn = Callable[[Prediction], str | None]
     _BoundFunctionWrapper = BoundFunctionWrapper[Any, Any]
     _FunctionWrapper = FunctionWrapper[Any, Any]
 else:
@@ -419,72 +418,28 @@ def _start_agent_invocation(
     return invocation
 
 
-def _count_history_messages(
-    history: History | Mapping[str, Any] | None,
-) -> int | None:
-    messages: object = (
-        history.get("messages")
-        if isinstance(history, Mapping)
-        else getattr(history, "messages", None)
+def _react_finish_reason(result: Prediction) -> str:
+    trajectory: Mapping[str, object] | None = getattr(
+        result, "trajectory", None
     )
-    return len(messages) if isinstance(messages, Sized) else None
-
-
-def _get_max_iters(instance: Module, kwargs: Mapping[str, Any]) -> int | None:
-    max_iters: object = kwargs.get(
-        "max_iters", getattr(instance, "max_iters", None)
-    )
-    return max_iters if isinstance(max_iters, int) else None
-
-
-def _react_finish_reason(
-    result: Prediction, max_iters: int | None, input_history_length: int
-) -> str | None:
-    trajectory: Mapping[str, Any] | None = getattr(result, "trajectory", None)
-    if not isinstance(trajectory, Mapping):
-        return None
-    tool_names = [
-        value
-        for key, value in trajectory.items()
-        if key.startswith("tool_name_")
-    ]
-    if tool_names and tool_names[-1] == "finish":
-        return "stop"
-    if max_iters is None:
-        return None
-    # Truncation drops the oldest trajectory steps but keeps the newest.
-    if max_iters <= 0 or f"tool_name_{max_iters - 1}" in trajectory:
-        return "max_iters"
+    if isinstance(trajectory, Mapping):
+        tool_names = [
+            value
+            for key, value in trajectory.items()
+            if key.startswith("tool_name_")
+        ]
+        if tool_names and tool_names[-1] == "finish":
+            return "stop"
     return "error"
 
 
-def _react_v2_finish_reason(
-    result: Prediction, max_iters: int | None, input_history_length: int
-) -> str | None:
-    termination_reason: str | None = getattr(
-        result, "termination_reason", None
-    )
+def _react_v2_finish_reason(result: Prediction) -> str | None:
+    termination_reason: object = getattr(result, "termination_reason", None)
     if termination_reason == "submit":
         return "stop"
-    if termination_reason == "forced_submit":
-        history_length = _count_history_messages(
-            getattr(result, "history", None)
-        )
-        if max_iters is None or history_length is None:
-            return None
-        # Each completed turn and the forced submit add one history event.
-        turns = history_length - input_history_length - 1
-        return "max_iters" if turns >= max_iters else "error"
-    # DSPy < 3.4 returns the break reason when the forced submit fails.
-    if termination_reason == "max_iters":
-        return "max_iters"
-    if termination_reason in (
-        "parse_error",
-        "context_window_exceeded",
-        "empty_tool_calls",
-    ):
+    if termination_reason in ("forced_submit", "parse_error"):
         return "error"
-    return None
+    return termination_reason if isinstance(termination_reason, str) else None
 
 
 def _set_agent_invocation_output(
@@ -519,20 +474,13 @@ def _react_forward(
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-        max_iters = _get_max_iters(instance, kwargs)
-        # ReActV2 appends to a caller-provided ``dspy.History`` in place.
-        history_length = _count_history_messages(kwargs.get("history")) or 0
         invocation = _start_agent_invocation(
             handler, instance, dict(kwargs), agent_name
         )
         with invocation:
             result = wrapped(*args, **kwargs)
             _set_agent_invocation_output(
-                handler,
-                invocation,
-                instance,
-                result,
-                finish_reason(result, max_iters, history_length),
+                handler, invocation, instance, result, finish_reason(result)
             )
             return result
 
@@ -550,20 +498,13 @@ def _react_aforward(
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-        max_iters = _get_max_iters(instance, kwargs)
-        # ReActV2 appends to a caller-provided ``dspy.History`` in place.
-        history_length = _count_history_messages(kwargs.get("history")) or 0
         invocation = _start_agent_invocation(
             handler, instance, dict(kwargs), agent_name
         )
         with invocation:
             result = await wrapped(*args, **kwargs)
             _set_agent_invocation_output(
-                handler,
-                invocation,
-                instance,
-                result,
-                finish_reason(result, max_iters, history_length),
+                handler, invocation, instance, result, finish_reason(result)
             )
             return result
 
